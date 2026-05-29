@@ -1,0 +1,41 @@
+{
+  "id": "evt_test_customer_created_001",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1715000000,
+  "type": "customer.created",
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": "req_test_001",
+    "idempotency_key": null
+  },
+  "data": {
+    "object": {
+      "id": "cus_TEST123",
+      "object": "customer",
+      "name": "Acme, Inc.",
+      "email": "billing@acme.example",
+      "description": "Test customer",
+      "currency": "usd",
+      "livemode": false,
+      "created": 1715000000,
+      "metadata": {
+        "internal_account_id": "acct_42"
+      },
+      "address": {
+        "city": "San Francisco",
+        "country": "US",
+        "line1": "1 Market St",
+        "line2": null,
+        "postal_code": "94105",
+        "state": "CA"
+      },
+      "phone": "+15555550100",
+      "preferred_locales": [],
+      "shipping": null,
+      "tax_exempt": "none",
+      "test_clock": null
+    }
+  }
+}

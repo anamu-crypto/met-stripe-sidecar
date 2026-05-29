@@ -1,0 +1,92 @@
+# Local development stack: Postgres + migrator + receiver + worker.
+#
+# Usage:
+#   1. cp .env.example .env  (and fill in real STRIPE_WEBHOOK_SECRET + METRONOME_API_KEY)
+#   2. docker compose up --build
+#
+# The `migrate` service runs `alembic upgrade head` once and exits. The
+# receiver and worker wait on its successful completion before starting.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sidecar
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: sidecar
+    ports:
+      - "5432:5432"
+    volumes:
+      - sidecar_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sidecar -d sidecar"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+    image: stripe-metronome-sidecar:local
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL to point at the compose `db` service regardless
+      # of what's in .env (which might be configured for the host).
+      DATABASE_URL: postgresql+asyncpg://sidecar:localdev@db:5432/sidecar
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  server:
+    image: stripe-metronome-sidecar:local
+    build:
+      context: .
+    command:
+      [
+        "uvicorn",
+        "sidecar.server:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sidecar:localdev@db:5432/sidecar
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    image: stripe-metronome-sidecar:local
+    build:
+      context: .
+    command: ["python", "-m", "sidecar.worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sidecar:localdev@db:5432/sidecar
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  sidecar_pgdata:

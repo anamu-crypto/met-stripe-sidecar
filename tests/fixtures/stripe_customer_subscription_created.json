@@ -1,0 +1,41 @@
+{
+  "id": "evt_test_subscription_created_001",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1767225600,
+  "type": "customer.subscription.created",
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": "req_test_sub_001",
+    "idempotency_key": null
+  },
+  "data": {
+    "object": {
+      "id": "sub_TEST123",
+      "object": "subscription",
+      "customer": "cus_TEST123",
+      "status": "active",
+      "current_period_start": 1767225600,
+      "current_period_end": 1769904000,
+      "items": {
+        "object": "list",
+        "data": [
+          {
+            "id": "si_TEST_1",
+            "object": "subscription_item",
+            "price": {
+              "id": "price_REPLACE_ME_startup",
+              "object": "price",
+              "currency": "usd",
+              "unit_amount": 10000,
+              "recurring": {
+                "interval": "month"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
