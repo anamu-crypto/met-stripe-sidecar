@@ -22,17 +22,28 @@ down on the contract this sidecar created.
 ## Why this exists
 
 If you bill on Stripe and meter usage on Metronome, you need a customer in
-both systems and a Metronome contract per Stripe subscription. Doing that
-manually is tedious and error-prone (and easy to get wrong on retries). This
-service does it automatically and idempotently from Stripe webhooks.
+both systems, a Metronome contract per Stripe subscription, and every
+Metronome customer wired to its Stripe counterpart so finalized invoices
+push back automatically. Doing that manually is tedious and error-prone
+(and easy to get wrong on retries). This service does it automatically and
+idempotently from Stripe webhooks.
 
 It is intended to be **forked and customized**, not consumed as a managed
 service. Every line you are expected to edit is tagged with `# CUSTOMIZE:`.
 
-The reverse direction — Metronome posting usage charges back onto Stripe
-invoices — is **not** in this codebase. That's the [Metronome ↔ Stripe OAuth
-integration](https://docs.metronome.com/connect-with-stripe) you wire up
-separately in the Metronome dashboard.
+## How the full Stripe ↔ Metronome integration fits together
+
+End-to-end usage-based billing on Stripe involves three independent pieces.
+This sidecar is one of them — knowing what each piece owns avoids the most
+common confusion ("does the sidecar send invoices? does it ingest usage?").
+
+| Piece | What it does | Where it lives |
+|---|---|---|
+| **Metronome's native Stripe integration** | One-time org-level OAuth connection between your Metronome org and your Stripe account. Lets Metronome create line items / charges on Stripe invoices. | Metronome Dashboard → Integrations → Stripe. Set up once, never again. See [docs.metronome.com/connect-with-stripe](https://docs.metronome.com/connect-with-stripe). |
+| **This sidecar** | Stripe → Metronome plumbing: customer create / update, subscription → contract create with the right recurring credit, **and** per-customer `billing_provider=stripe` + `stripe_customer_id` configuration on every Metronome customer (which is what tells Metronome's native integration *where* to push the finalized invoice). | This repo. Two long-running processes + Postgres. |
+| **Your application** | Sends usage events to Metronome (using the Stripe customer ID, since this sidecar registers it as an `ingest_alias`). | Wherever your code already runs. |
+
+Put together: a Stripe webhook fires → the sidecar mirrors customer + subscription into Metronome → your app emits usage events → Metronome aggregates them against the contract → Metronome's native integration pushes the finalized invoice line item back onto the Stripe customer's invoice. The sidecar covers the first leg and configures every customer so the last leg is automatic.
 
 ## Architecture
 
@@ -114,19 +125,27 @@ log dashboard or implement them yourself before you depend on them.
 | Prorations / mid-period plan changes | Not modeled. |
 | Backfill of pre-existing Stripe customers / subscriptions | Out of scope. Run a one-shot script. |
 
-### Explicitly out of scope
+### Not part of this sidecar (lives in another piece of the integration)
 
-| | Why |
+These are part of the end-to-end use case but **not** this codebase's job.
+Confusion about this is the most common first-day question.
+
+| | Where it lives instead |
 |---|---|
-| Usage event ingestion | Customers send usage events directly to Metronome with the Stripe customer ID. |
-| Invoice push-back (Metronome → Stripe invoice line items) | Configured separately via the Metronome ↔ Stripe OAuth integration in the Metronome dashboard. |
-| Stripe Connect / multi-account | Single-account setups only. |
-| UI / dashboard | Use `psql` and your log aggregator. |
-| Production Terraform / Kubernetes manifests | Every team has a deployment platform of choice; a prescriptive one would just be in your way. |
+| Usage event ingestion | Your application sends usage events directly to Metronome's ingestion endpoint, keyed on the Stripe customer ID. The sidecar's customer mapper registers that ID as a Metronome `ingest_alias`. |
+| Finalized invoice push-back (Metronome → Stripe) | Handled by Metronome's native Stripe integration (org-level OAuth, one-time setup). The sidecar enables this *per customer* by setting `billing_provider=stripe` + `stripe_customer_id` on every Metronome customer it creates. |
+| Stripe Connect / multi-account | Out of scope. Single-Stripe-account setups only. |
+| UI / dashboard for `webhook_events` | Out of scope. Use `psql` and your log aggregator. |
+| Terraform / Helm / Kubernetes manifests | Out of scope. Every team has a deployment platform of choice; a prescriptive one would just be in your way. |
 
 ---
 
 ## Local setup walkthrough
+
+> This section is for **getting the sidecar running on a laptop so you can
+> see what it does and customize the mappers.** Production deployment is a
+> different topology — see [Production deployment](#production-deployment).
+> The same code runs in both; only the surrounding infrastructure changes.
 
 If you've never run this before, follow the five steps below in order. If you
 get stuck, jump to [Troubleshooting](#troubleshooting). The Docker path is
@@ -406,44 +425,112 @@ layer, `tests/test_handlers_customer.py` and
 `tests/test_handlers_subscription.py` show the integration-test pattern
 (real Postgres, `respx`-mocked Metronome).
 
-## Deployment notes
+## Production deployment
 
-This repo deliberately ships no Terraform / Helm / Kubernetes manifests —
-every team has a deployment platform of choice and a prescriptive one would
-just be in your way. What you need to know:
+The local-dev setup above (Docker Compose, or three terminals on a laptop)
+is intentionally minimal. **The same code is what you run in production** —
+nothing in this repo is "for local only." The local setup just collapses
+the production topology onto one machine. This section answers "what does
+that production topology look like, and is it good enough for a real
+business?"
 
-- **Two long-running processes per environment.** Run the receiver (HTTP)
-  and the worker (no ports) from the same image. The receiver is stateless
-  and horizontally scalable behind any load balancer. The worker is also
-  horizontally scalable (multiple replicas are safe — see "Architecture").
-- **One managed Postgres.** Schema is small (three tables). A 1 vCPU /
-  small-instance Postgres is more than enough for thousands of webhooks
-  per minute. Enable point-in-time recovery — the `webhook_events` table
-  is your audit log of every Stripe message you've seen.
-- **Migrations.** Run `alembic upgrade head` once per release, before
+### Topology
+
+```
+   Stripe ───── HTTPS POST ─────▶ Load balancer
+                                       │
+                                       ▼
+                               ┌───────────────┐         ┌─────────────────┐
+                               │  Receiver     │         │  Worker         │
+                               │  (uvicorn,    │         │  (no port,      │
+                               │   stateless,  │         │   stateless,    │
+                               │   N replicas) │         │   N replicas)   │
+                               └───────┬───────┘         └────────┬────────┘
+                                       │                          │
+                                       ▼                          ▼
+                                  ┌────────────────────────────────┐
+                                  │  Managed Postgres              │
+                                  │  webhook_events / *_mappings   │
+                                  └────────────────────────────────┘
+```
+
+- **Receiver**: stateless HTTP service. Run **two or more replicas** behind
+  any L7 load balancer with TLS termination. Every Stripe webhook lands on
+  one replica, gets verified, written to Postgres in one round-trip,
+  returns 200. Receiver replicas don't talk to each other.
+- **Worker**: same Docker image, different command (`python -m
+  sidecar.worker`). No ports exposed. Horizontally scalable: multiple
+  replicas are safe because the queue query uses
+  `SELECT … FOR UPDATE SKIP LOCKED`. Two workers polling the same row see
+  exactly one of them claim it.
+- **Postgres**: managed (RDS, Cloud SQL, Neon, Supabase, etc.). Schema is
+  three tables and a partial index. Point-in-time recovery should be on —
+  `webhook_events` is your audit log of every Stripe message you've ever
+  received.
+- **Migrations**: run `alembic upgrade head` once per release, **before**
   rolling out the new app version. The `migrate` service in
-  `docker-compose.yml` shows the exact command; replicate it as a CI step
-  or a Kubernetes Job.
-- **Stripe webhook configuration.** In the Stripe dashboard, point a
-  webhook endpoint at `https://<your-host>/webhooks/stripe`. Subscribe to
-  at least `customer.created`, `customer.updated`, and
-  `customer.subscription.created`. If you want the no-op (warning-level)
-  audit trail, also subscribe to `customer.subscription.updated` and
-  `customer.subscription.deleted` so your operators see when v0.2a's gaps
-  would have mattered. Copy the signing secret into
-  `STRIPE_WEBHOOK_SECRET`.
-- **Stripe API version.** The mapper reads `current_period_start` from the
-  subscription item first and falls back to the subscription level, so it
-  works on both Stripe API ≤ 2024-12-01 and ≥ 2025-03-31. If you pin a
-  specific API version in your Stripe webhook endpoint, that's the one
-  this sidecar will see — pin deliberately and don't change it without
+  `docker-compose.yml` shows the command; replicate it as a CI step, a
+  Kubernetes Job, or an ECS one-shot task.
+- **Webhook endpoint**: configure in Stripe Dashboard → Developers →
+  Webhooks → `https://<your-host>/webhooks/stripe`. Subscribe to at least
+  `customer.created`, `customer.updated`, and
+  `customer.subscription.created`. Subscribe to
+  `customer.subscription.updated` and `customer.subscription.deleted` too
+  if you want the warning-level audit trail (see [What's not handled](#whats-not-handled-yet)).
+  Pin the Stripe API version on the endpoint and don't change it without
   re-running the test suite.
-- **Secrets.** `STRIPE_WEBHOOK_SECRET` and `METRONOME_API_KEY` should come
+- **Secrets**: `STRIPE_WEBHOOK_SECRET` and `METRONOME_API_KEY` should come
   from your secrets manager (AWS Secrets Manager, GCP Secret Manager,
   Vault). They are read at process startup and not refreshed at runtime;
-  restart the processes when rotating.
-- **Logging.** All output is JSON on stdout. Ship it wherever you ship the
-  rest of your logs.
+  redeploy when rotating.
+- **Logging**: JSON to stdout. Ship it to the same place as your other
+  services.
+
+### Will this scale to a real customer base?
+
+**Short answer: yes, for tens of thousands of customers and well into
+hundreds of webhooks per second.** Long answer:
+
+| Concern | What's true today | What you may want to add |
+|---|---|---|
+| Throughput on the receiver | A 1 vCPU receiver replica handles >1k webhooks/sec because all it does is verify HMAC + insert one row. Scale horizontally — Stripe webhooks are independent events. | Standard L7 LB. |
+| Worker throughput | One worker processes events serially per replica (each event holds a row lock during the Metronome call). To raise total throughput, run more worker replicas. Practical ceiling is set by Metronome's API rate limits, not Postgres. | More replicas. Watch Metronome 429s — the worker already retries them, but consistent rate limiting means you need fewer parallel workers, not more. |
+| Postgres load | Three tables, partial index on the hot path, `INSERT … ON CONFLICT DO NOTHING` on the receiver, `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` on the worker. A small managed Postgres is enough for thousands of webhooks per minute. | Right-size the instance; enable PITR. |
+| `webhook_events` table growth | Grows by one row per Stripe webhook *of every type*, processed or not. At 100k events/day that's ~36M rows/year. Postgres handles it; query performance does not degrade because of the partial index. | Add a retention job that archives or deletes `processed` rows older than N days. Out of scope here — write a small cron / scheduled task. |
+| `customer_mappings` / `subscription_mappings` growth | One row per customer / subscription. At your scale, well under any limit worth thinking about. | None. |
+| Metronome API rate limits | The client classifies 429 + 5xx as transient and retries with exponential backoff + full jitter. Permanent 4xx are marked `failed` and stop retrying. | Tune `WORKER_RETRY_BASE_SECONDS` / `WORKER_RETRY_CAP_SECONDS` if you have a known burst pattern. |
+| Stripe webhook retries | Stripe retries non-2xx responses for up to ~3 days. The receiver is idempotent on `stripe_event_id`, so retries are safe and a no-op. | None. |
+| Observability | JSON logs only. Counters / SLOs are bring-your-own. | Wire to Datadog / Prometheus / Cloudwatch. Useful metrics: `webhook_events.status='failed'` count (page on > 0), oldest pending event age (page on > 5 min), p95 handler latency from the `handler_completed` log lines. |
+| Multi-region / DR | Single-Postgres design. A regional outage in your DB region takes the sidecar offline, but Stripe will keep retrying for ~3 days, so events aren't lost. | Replicate your managed Postgres across regions if your RTO requires it. |
+| Backfill of pre-existing customers | Out of scope. | Write a one-shot script that pages Stripe `/v1/customers` and `/v1/subscriptions` and feeds each through the same handlers. Roughly a day of work. |
+| Stripe Connect / multiple Stripe accounts | Not supported. The signing secret is a single value. | Run one sidecar instance per connected account if you absolutely need this. |
+
+### Gaps a large business should size carefully before depending on this
+
+These aren't capacity issues — they're behavioral gaps that are bigger
+problems at scale than they look:
+
+1. **`customer.subscription.deleted` does not terminate the Metronome
+   contract.** If you have a meaningful churn rate, those contracts pile
+   up and continue accruing credit. v0.2b territory; work around with a
+   reconciliation job until then.
+2. **`customer.subscription.updated` does not propagate plan changes.**
+   Mid-period upgrades / downgrades on Stripe are silently not reflected
+   in Metronome. Same v0.2b answer.
+3. **No backfill mode.** The sidecar only acts on webhooks going forward
+   from the moment you turn it on. Pre-existing customers / subscriptions
+   need a one-shot script.
+4. **Tier config (`TIERS`) drift.** Adding a new Stripe price without a
+   corresponding entry in `src/sidecar/config/tiers.py` permanently fails
+   every subscription on that price (loud, but fail-closed). Make
+   `tiers.py` part of your launch checklist.
+5. **No metrics / alerting out of the box.** You will want a dashboard
+   showing `webhook_events` by status and age — wiring it up is on you.
+
+If those tradeoffs are acceptable (or you plan to close them yourself),
+the architecture is genuinely production-grade for a tens-of-thousands-of-
+customers business. If they aren't, treat this repo as an excellent
+starting point that you'll extend, not a finished product.
 
 ## Troubleshooting
 
