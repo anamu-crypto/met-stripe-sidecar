@@ -1,5 +1,7 @@
 # Stripe → Metronome Sidecar
 
+Please Fork the Repository 
+
 [![CI](https://github.com/REPLACE-ME/stripe-metronome-sidecar/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
